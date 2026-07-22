@@ -1,6 +1,6 @@
 <#
     ============================================================
-     USB MANAGER 
+     USB MANAGER  v3.0
      Gestionare aparate USB, intrari (hub-uri) si mufe fizice.
 
      Rulare locala:
@@ -33,17 +33,55 @@ $script:LogFile   = Join-Path $script:Root 'jurnal.log'
 $script:StateFile = Join-Path $script:Root 'stare.json'
 $script:NamesFile = Join-Path $script:Root 'denumiri.json'
 $script:PortMap   = Join-Path $script:Root 'mufe.json'
+$script:ConfigFile = Join-Path $script:Root 'setari.json'
 $script:BackupDir = Join-Path $script:Root 'copii'
 $script:PolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions'
 $script:StorKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR'
 New-Item -ItemType Directory -Path $script:BackupDir -Force | Out-Null
 
-# Ce nu se atinge niciodata
-$script:Protejate = @(
-    'Root Hub', 'Host Controller', 'eXtensible',
-    'HID Keyboard', 'HID-compliant mouse', 'Tastatura'
-)
+# ---- Protectie configurabila ----
+# Nivel 2 (TOTAL)  : hub principal + orice tastatura/mouse USB   [implicit]
+# Nivel 1 (MINIM)  : doar hub principal si controllerele
+# Nivel 0 (OPRITA) : nimic protejat, raspunzi tu de tot
 
+# Tot ce e sub 'Critic' NU se poate scoate niciodata din protectie -
+# fara controller nu mai exista USB deloc, iar reactivarea cere reboot.
+$script:Critic = @('Host Controller', 'eXtensible', 'Root Hub')
+
+# Protectie suplimentara, activa doar pe nivelul 2
+$script:ProtInput = @('HID Keyboard', 'HID-compliant mouse', 'Tastatura', 'Keyboard', 'Mouse')
+
+function Get-Setari {
+    if (Test-Path $script:ConfigFile) {
+        try { return (Get-Content $script:ConfigFile -Raw | ConvertFrom-Json) } catch {}
+    }
+    return [PSCustomObject]@{ Nivel = 2; Exceptii = @() }
+}
+
+function Set-Setari {
+    param($S)
+    $S | ConvertTo-Json -Depth 3 | Set-Content $script:ConfigFile -Encoding UTF8
+}
+
+# Detecteaza daca masina e laptop. Pe laptop tastatura si touchpad-ul
+# sunt de obicei interne (PS/2 sau I2C), nu pe USB - deci nivelul 1 e sigur.
+function Test-Laptop {
+    try {
+        $t = (Get-CimInstance Win32_SystemEnclosure -EA SilentlyContinue).ChassisTypes
+        return (@($t) | Where-Object { $_ -in 8,9,10,11,12,14,18,21,30,31,32 }).Count -gt 0
+    } catch { return $false }
+}
+
+# Tastatura sau mouse-ul chiar stau pe USB? Daca nu, protectia nivel 2 e inutila.
+function Test-InputPeUSB {
+    $k = @(Get-PnpDevice -PresentOnly -EA SilentlyContinue |
+           Where-Object { $_.InstanceId -like 'USB\*' -and
+                          $_.Class -in 'HIDClass','Keyboard','Mouse' -and
+                          $_.FriendlyName -match 'Keyboard|Mouse|Tastatura' })
+    return ($k.Count -gt 0)
+}
+
+$script:Setari  = Get-Setari
 $script:Filtru  = ''
 $script:Ascunse = $false
 #endregion
@@ -126,11 +164,25 @@ function Refresh-Pnp {
     Start-Sleep -Milliseconds $Asteapta
 }
 
+# Returneaza: 'critic' (niciodata de atins), 'protejat' (dupa nivel), sau $null
+function Get-TipProtectie {
+    param($D)
+
+    foreach ($p in $script:Critic) { if ($D.Nume -match $p) { return 'critic' } }
+
+    if ($script:Setari.Nivel -le 0) { return $null }
+    if ($script:Setari.Nivel -eq 1) { return $null }   # nivel 1 = doar critic
+
+    # Nivel 2: si input-ul USB
+    if ($D.InstanceId -in @($script:Setari.Exceptii)) { return $null }
+    foreach ($p in $script:ProtInput) { if ($D.Nume -match $p) { return 'protejat' } }
+    if ($D.Clasa -in 'HIDClass','Keyboard','Mouse' -and $D.Nume -match 'Keyboard|Mouse|Tastatura') { return 'protejat' }
+    return $null
+}
+
 function Test-Protejat {
     param($D)
-    foreach ($p in $script:Protejate) { if ($D.Nume -match $p) { return $true } }
-    if ($D.Clasa -in 'HIDClass','Keyboard','Mouse' -and $D.Nume -match 'Keyboard|Mouse|Tastatura') { return $true }
-    return $false
+    return ($null -ne (Get-TipProtectie $D))
 }
 
 function Get-USBDevices {
@@ -149,8 +201,10 @@ function Get-USBDevices {
             Adancime   = ($d.InstanceId -split '\\').Count
             InstanceId = $d.InstanceId
             Protejat   = $false
+            TipProt    = $null
         }
-        $o.Protejat = Test-Protejat $o
+        $o.TipProt  = Get-TipProtectie $o
+        $o.Protejat = ($null -ne $o.TipProt)
         $o
     }
 
@@ -190,7 +244,7 @@ function Show-Devices {
         if ($x.Clasa -ne $cls) { $cls = $x.Clasa; Write-Host "" }
 
         $s = Stare-Text $x
-        $mark = if ($x.Protejat) { '*' } else { ' ' }
+        $mark = switch ($x.TipProt) { 'critic' { '!' } 'protejat' { '*' } default { ' ' } }
         $n = $x.Nume
         if ($n.Length -gt 38) { $n = $n.Substring(0, 35) + '...' }
 
@@ -203,7 +257,8 @@ function Show-Devices {
     }
 
     Write-Host ""
-    Write-Host "   * = protejat (tastatura, mouse, hub principal) - nu poate fi oprit" -ForegroundColor $C.Sters
+    Write-Host "   ! = critic, nu se poate opri niciodata (controller, hub principal)" -ForegroundColor $C.Sters
+    Write-Host "   * = protejat de setarea curenta - se poate scoate din meniul  G" -ForegroundColor $C.Sters
 }
 
 function Citeste-Indici {
@@ -238,8 +293,13 @@ function Actioneaza {
     $ok = 0; $sarit = 0; $esec = 0
     Write-Host ""
     foreach ($x in $tinte) {
-        if ($Ce -eq 'Opreste' -and $x.Protejat) {
-            Write-Host "     [sarit] $($x.Nume) - protejat" -ForegroundColor $C.Atent
+        if ($Ce -eq 'Opreste' -and $x.TipProt -eq 'critic') {
+            Write-Host "     [sarit] $($x.Nume) - critic, nu se atinge" -ForegroundColor $C.Rau
+            Write-Log "Sarit critic: $($x.Nume)" WARN
+            $sarit++; continue
+        }
+        if ($Ce -eq 'Opreste' -and $x.TipProt -eq 'protejat') {
+            Write-Host "     [sarit] $($x.Nume) - protejat (scoate-l din meniul G)" -ForegroundColor $C.Atent
             Write-Log "Sarit protejat: $($x.Nume)" WARN
             $sarit++; continue
         }
@@ -644,6 +704,151 @@ function Meniu-Mufe {
 #endregion
 
 
+#region ---------- Protectie ----------
+function Nume-Nivel {
+    param([int]$N)
+    switch ($N) {
+        0 { return 'OPRITA - nimic protejat' }
+        1 { return 'MINIMA - doar controllerul' }
+        2 { return 'TOTALA - controller + tastatura/mouse' }
+        default { return "necunoscut ($N)" }
+    }
+}
+
+function Meniu-Protectie {
+    do {
+        Clear-Host
+        Cadru "PROTECTIE" "ce nu are voie scriptul sa opreasca"
+
+        $niv = [int]$script:Setari.Nivel
+        $col = switch ($niv) { 0 { $C.Rau } 1 { $C.Atent } default { $C.Ok } }
+        Write-Host ""
+        Write-Host "   Nivel curent : " -ForegroundColor $C.Sters -NoNewline
+        Write-Host (Nume-Nivel $niv) -ForegroundColor $col
+
+        $exc = @($script:Setari.Exceptii)
+        Write-Host "   Exceptii     : " -ForegroundColor $C.Sters -NoNewline
+        Write-Host "$($exc.Count) aparate scoase manual" -ForegroundColor $C.Info
+
+        # Sfat in functie de masina
+        Write-Host ""
+        $eLaptop = Test-Laptop
+        $inputUSB = Test-InputPeUSB
+        if ($eLaptop) {
+            Write-Host "   Masina pare LAPTOP." -ForegroundColor $C.Info
+            if (-not $inputUSB) {
+                Write-Host "   Tastatura si touchpad-ul sunt interne, nu pe USB." -ForegroundColor $C.Sters
+                Write-Host "   Nivelul 1 e sigur aici - nu ai ce pierde." -ForegroundColor $C.Ok
+            } else {
+                Write-Host "   Ai totusi tastatura sau mouse pe USB - atentie la nivelul 1." -ForegroundColor $C.Atent
+            }
+        } else {
+            Write-Host "   Masina pare DESKTOP." -ForegroundColor $C.Info
+            if ($inputUSB) {
+                Write-Host "   Tastatura sau mouse-ul sunt pe USB. Daca le oprești, ramai" -ForegroundColor $C.Atent
+                Write-Host "   fara ele pana la repornire. Tine nivelul 2." -ForegroundColor $C.Atent
+            } else {
+                Write-Host "   Nu vad tastatura pe USB - probabil e PS/2. Nivelul 1 e ok." -ForegroundColor $C.Ok
+            }
+        }
+
+        Sectiune "Ce faci"
+        Tasta '1' 'Nivel TOTAL';    Tasta '2' 'Nivel MINIM'
+        Write-Host ""
+        Tasta '3' 'Nivel OPRIT';    Tasta '4' 'Scoate un aparat'
+        Write-Host ""
+        Tasta '5' 'Vezi exceptiile'; Tasta '6' 'Sterge exceptiile'
+        Write-Host ""
+        Tasta '0' 'Inapoi'
+        Write-Host "`n"
+
+        $c = (Read-Host "   Alege").Trim()
+        switch ($c) {
+            '1' {
+                $script:Setari.Nivel = 2; Set-Setari $script:Setari
+                Mesaj "Protectie TOTALA. Tastatura si mouse-ul USB sunt blocate." ok
+                Write-Log "Nivel protectie -> 2" ACTION; Pauza 2
+            }
+            '2' {
+                Write-Host ""
+                Write-Host "   Nivelul MINIM lasa doar controllerul protejat." -ForegroundColor $C.Atent
+                Write-Host "   Vei putea opri inclusiv tastatura si mouse-ul de pe USB." -ForegroundColor $C.Atent
+                if (Test-InputPeUSB) {
+                    Write-Host "   ATENTIE: chiar ai input pe USB acum." -ForegroundColor $C.Rau
+                }
+                if (Intreaba-DaNu "Trec pe nivel MINIM?") {
+                    $script:Setari.Nivel = 1; Set-Setari $script:Setari
+                    Mesaj "Protectie MINIMA." ok
+                    Write-Log "Nivel protectie -> 1" ACTION
+                }
+                Pauza 2
+            }
+            '3' {
+                Write-Host ""
+                Write-Host "   Fara protectie poti opri orice, inclusiv aparate de care" -ForegroundColor $C.Rau
+                Write-Host "   depinzi ca sa mai poti folosi calculatorul." -ForegroundColor $C.Rau
+                Write-Host "   Controllerul ramane blocat oricum - altfel nu mai exista USB." -ForegroundColor $C.Sters
+                if (Intreaba-DaNu "Chiar opresc protectia?") {
+                    $script:Setari.Nivel = 0; Set-Setari $script:Setari
+                    Mesaj "Protectie OPRITA. Ai grija ce oprești." atent
+                    Write-Log "Nivel protectie -> 0" ACTION
+                }
+                Pauza 2
+            }
+            '4' {
+                Clear-Host
+                Cadru "SCOATE UN APARAT DIN PROTECTIE"
+                $lista = @(Get-USBDevices | Where-Object { $_.TipProt -eq 'protejat' })
+                if ($lista.Count -eq 0) {
+                    Mesaj "Niciun aparat protejat de setarea curenta." info; Pauza 2; continue
+                }
+                Write-Host ""
+                for ($i = 0; $i -lt $lista.Count; $i++) {
+                    Write-Host ("   {0,-4} {1,-22} {2}" -f $i, $lista[$i].Cod, $lista[$i].Nume) -ForegroundColor $C.Info
+                }
+                Write-Host ""
+                $n = Read-Host "   Numarul aparatului"
+                if ($n -match '^\d+$' -and [int]$n -lt $lista.Count) {
+                    $x = $lista[[int]$n]
+                    $e = @($script:Setari.Exceptii)
+                    if ($x.InstanceId -notin $e) { $e += $x.InstanceId }
+                    $script:Setari.Exceptii = $e
+                    Set-Setari $script:Setari
+                    Mesaj "Scos din protectie: $($x.Nume)" ok
+                    Write-Log "Exceptie adaugata: $($x.InstanceId)" ACTION
+                }
+                Pauza 2
+            }
+            '5' {
+                Clear-Host
+                Cadru "APARATE SCOASE DIN PROTECTIE"
+                $e = @($script:Setari.Exceptii)
+                Write-Host ""
+                if ($e.Count -eq 0) { Write-Host "   (niciunul)" -ForegroundColor $C.Sters }
+                foreach ($id in $e) {
+                    $d = Get-PnpDevice -InstanceId $id -EA SilentlyContinue
+                    $nm = if ($d) { $d.FriendlyName } else { '(deconectat)' }
+                    Write-Host ("   {0}" -f $nm) -ForegroundColor $C.Info
+                    Write-Host ("      $id") -ForegroundColor $C.Sters
+                }
+                Enter
+            }
+            '6' {
+                if (Intreaba-DaNu "Sterg toate exceptiile?") {
+                    $script:Setari.Exceptii = @()
+                    Set-Setari $script:Setari
+                    Mesaj "Exceptii sterse. Protectia revine la normal." ok
+                    Write-Log "Exceptii sterse" ACTION
+                }
+                Pauza 2
+            }
+            default { return }
+        }
+    } while ($true)
+}
+#endregion
+
+
 #region ---------- Paza ----------
 function Get-StarePaza {
     if (-not (Test-Path $script:PolicyKey)) { return 'OPRITA' }
@@ -784,8 +989,14 @@ function Bara-Sumar {
     if ($paza -eq 'OPRITA') { Write-Host " paza oprita "  -ForegroundColor Black -BackgroundColor Gray        -NoNewline }
     else                    { Write-Host " PAZA PORNITA " -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline }
     Write-Host " " -NoNewline
-    if ($stoc -eq 'INTERZISE') { Write-Host " stick blocat " -ForegroundColor White -BackgroundColor DarkRed }
-    else                       { Write-Host " stick permis " -ForegroundColor Black -BackgroundColor Gray }
+    if ($stoc -eq 'INTERZISE') { Write-Host " stick blocat " -ForegroundColor White -BackgroundColor DarkRed -NoNewline }
+    else                       { Write-Host " stick permis " -ForegroundColor Black -BackgroundColor Gray    -NoNewline }
+    Write-Host " " -NoNewline
+    switch ([int]$script:Setari.Nivel) {
+        0 { Write-Host " FARA PROTECTIE " -ForegroundColor White -BackgroundColor DarkRed }
+        1 { Write-Host " protectie minima " -ForegroundColor Black -BackgroundColor DarkYellow }
+        default { Write-Host " protectie totala " -ForegroundColor Black -BackgroundColor Gray }
+    }
 }
 
 function Arata-Jurnal {
@@ -822,11 +1033,11 @@ do {
     Write-Host ""
     Tasta 'I' 'Intrari USB';       Tasta 'M' 'Mufe fizice';     Tasta 'K' 'Paza'
     Write-Host ""
-    Tasta 'S' 'Salveaza stare';    Tasta 'R' 'Reface stare';    Tasta 'F' 'Filtru'
+    Tasta 'G' 'Protectie';         Tasta 'S' 'Salveaza stare';  Tasta 'R' 'Reface stare'
     Write-Host ""
-    Tasta 'A' 'Arata deconectate'; Tasta 'J' 'Jurnal';          Tasta 'X' 'Reincarca'
+    Tasta 'F' 'Filtru';            Tasta 'A' 'Arata deconectate'; Tasta 'J' 'Jurnal'
     Write-Host ""
-    Tasta 'Q' 'Iesire'
+    Tasta 'X' 'Reincarca';         Tasta 'Q' 'Iesire'
     Write-Host "`n"
 
     $k = (Read-Host "   Alege").Trim().ToUpper()
@@ -838,6 +1049,7 @@ do {
         'I' { Meniu-Intrari }
         'M' { Meniu-Mufe }
         'K' { Meniu-Paza }
+        'G' { Meniu-Protectie }
         'S' { Export-Stare }
         'R' { Import-Stare }
         'F' { $script:Filtru = (Read-Host "   Text de cautat (gol = fara filtru)").Trim() }
