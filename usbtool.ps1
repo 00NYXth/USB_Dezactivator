@@ -1,6 +1,6 @@
 <#
     ============================================================
-     USB MANAGER  v3.0
+     USB MANAGER 
      Gestionare aparate USB, intrari (hub-uri) si mufe fizice.
 
      Rulare locala:
